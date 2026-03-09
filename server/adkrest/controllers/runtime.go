@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"time"
 
@@ -167,6 +168,10 @@ func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, event sessi
 	return nil
 }
 
+// validateSessionExists fetches the session by appName, userID, and sessionID from the request.
+// Security: userID and sessionID are taken from the request body and are not verified against
+// the authenticated user. When authentication is enabled, callers should ensure the request's
+// userId matches the identity from the auth token/session before invoking this handler.
 func (c *RuntimeAPIController) validateSessionExists(ctx context.Context, appName, userID, sessionID string) (session.Session, error) {
 	resp, err := c.sessionService.Get(ctx, &session.GetRequest{
 		AppName:   appName,
@@ -180,20 +185,19 @@ func (c *RuntimeAPIController) validateSessionExists(ctx context.Context, appNam
 }
 
 // applyStateDeltaIfPresent appends a state_delta event to the session when the request
-// includes a non-empty StateDelta. The map is shallow-copied so the event does not
-// share the request's map.
+// includes a non-empty StateDelta. The map is shallow-copied via maps.Clone so the
+// event does not share the request's map.
+//
+// Security: stateDelta keys are not validated here; the request can include app-scoped
+// (app:) and user-scoped (user:) keys. Callers or the session service should sanitize
+// to allowed keys or enforce access control to prevent injection of arbitrary state.
 func (c *RuntimeAPIController) applyStateDeltaIfPresent(ctx context.Context, ssn session.Session, stateDelta *map[string]any) error {
 	if stateDelta == nil || len(*stateDelta) == 0 {
 		return nil
 	}
 	ev := session.NewEvent(uuid.New().String())
 	ev.Author = "system"
-
-	deltaCopy := make(map[string]any, len(*stateDelta))
-	for k, v := range *stateDelta {
-		deltaCopy[k] = v
-	}
-	ev.Actions.StateDelta = deltaCopy
+	ev.Actions.StateDelta = maps.Clone(*stateDelta)
 	return c.sessionService.AppendEvent(ctx, ssn, ev)
 }
 
