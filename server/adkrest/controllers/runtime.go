@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/artifact"
 	"google.golang.org/adk/memory"
@@ -64,9 +65,13 @@ func (c *RuntimeAPIController) RunHandler(rw http.ResponseWriter, req *http.Requ
 
 // RunAgent executes a non-streaming agent run for a given session and message.
 func (c *RuntimeAPIController) runAgent(ctx context.Context, runAgentRequest models.RunAgentRequest) ([]*session.Event, error) {
-	err := c.validateSessionExists(ctx, runAgentRequest.AppName, runAgentRequest.UserId, runAgentRequest.SessionId)
+	ssn, err := c.validateSessionExists(ctx, runAgentRequest.AppName, runAgentRequest.UserId, runAgentRequest.SessionId)
 	if err != nil {
 		return nil, err
+	}
+
+	if err := c.applyStateDeltaIfPresent(ctx, ssn, runAgentRequest.StateDelta); err != nil {
+		return nil, newStatusError(fmt.Errorf("failed to append event: %w", err), http.StatusInternalServerError)
 	}
 
 	r, rCfg, err := c.getRunner(runAgentRequest)
@@ -105,9 +110,13 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 		return err
 	}
 
-	err = c.validateSessionExists(req.Context(), runAgentRequest.AppName, runAgentRequest.UserId, runAgentRequest.SessionId)
+	ssn, err := c.validateSessionExists(req.Context(), runAgentRequest.AppName, runAgentRequest.UserId, runAgentRequest.SessionId)
 	if err != nil {
 		return err
+	}
+
+	if err := c.applyStateDeltaIfPresent(req.Context(), ssn, runAgentRequest.StateDelta); err != nil {
+		return newStatusError(fmt.Errorf("failed to append event: %w", err), http.StatusInternalServerError)
 	}
 
 	r, rCfg, err := c.getRunner(runAgentRequest)
@@ -158,16 +167,34 @@ func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, event sessi
 	return nil
 }
 
-func (c *RuntimeAPIController) validateSessionExists(ctx context.Context, appName, userID, sessionID string) error {
-	_, err := c.sessionService.Get(ctx, &session.GetRequest{
+func (c *RuntimeAPIController) validateSessionExists(ctx context.Context, appName, userID, sessionID string) (session.Session, error) {
+	resp, err := c.sessionService.Get(ctx, &session.GetRequest{
 		AppName:   appName,
 		UserID:    userID,
 		SessionID: sessionID,
 	})
 	if err != nil {
-		return newStatusError(fmt.Errorf("failed to get session: %w", err), http.StatusNotFound)
+		return nil, newStatusError(fmt.Errorf("failed to get session: %w", err), http.StatusNotFound)
 	}
-	return nil
+	return resp.Session, nil
+}
+
+// applyStateDeltaIfPresent appends a state_delta event to the session when the request
+// includes a non-empty StateDelta. The map is shallow-copied so the event does not
+// share the request's map.
+func (c *RuntimeAPIController) applyStateDeltaIfPresent(ctx context.Context, ssn session.Session, stateDelta *map[string]any) error {
+	if stateDelta == nil || len(*stateDelta) == 0 {
+		return nil
+	}
+	ev := session.NewEvent(uuid.New().String())
+	ev.Author = "system"
+
+	deltaCopy := make(map[string]any, len(*stateDelta))
+	for k, v := range *stateDelta {
+		deltaCopy[k] = v
+	}
+	ev.Actions.StateDelta = deltaCopy
+	return c.sessionService.AppendEvent(ctx, ssn, ev)
 }
 
 func (c *RuntimeAPIController) getRunner(req models.RunAgentRequest) (*runner.Runner, *agent.RunConfig, error) {
